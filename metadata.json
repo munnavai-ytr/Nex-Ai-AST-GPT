@@ -1,0 +1,6 @@
+{
+  "name": "NEX",
+  "description": "Premium personal AI assistant for Android with autonomous action planning and local memory.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

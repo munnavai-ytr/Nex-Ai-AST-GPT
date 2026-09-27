@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">NEX</string>
+    <string name="accessibility_service_label">NEX AI Assistant Service</string>
+    <string name="accessibility_service_description">Enables NEX to safely inspect app interfaces, assist with on-screen navigation, and execute user-authorized device actions.</string>
+    <string name="notification_channel_name">NEX Assistant Status</string>
+    <string name="notification_channel_desc">Shows active execution and background assistant status for NEX.</string>
+    <string name="service_running_title">NEX Active</string>
+    <string name="service_running_text">Assistant core is running and ready for commands.</string>
+</resources>
