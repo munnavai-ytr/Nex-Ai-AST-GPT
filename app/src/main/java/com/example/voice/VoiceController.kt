@@ -140,6 +140,14 @@ class VoiceController(
         settingsRepository.setAutoSpeakResponses(autoSpeak)
     }
 
+    fun destroy() {
+        stopListening()
+        stopSpeech()
+        speechRecognizerManager.destroy()
+        ttsManager.shutdown()
+        wakeWordManager.stopListeningForWakeWord()
+    }
+
     private fun stripWakePrefix(raw: String): String {
         var text = raw.trim()
         val prefixes = listOf(

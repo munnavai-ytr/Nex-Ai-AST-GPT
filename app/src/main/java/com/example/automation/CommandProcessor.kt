@@ -32,6 +32,7 @@ class CommandProcessor(
 
     private var currentActiveTaskId: String? = null
     private var currentPrompt: String = ""
+    private var currentPlanningJob: kotlinx.coroutines.Job? = null
 
     init {
         actionQueue?.onSpokenFeedback = { speech ->
@@ -45,6 +46,9 @@ class CommandProcessor(
     fun processCommand(prompt: String) {
         val trimmed = prompt.trim()
         if (trimmed.isBlank()) return
+
+        // Cancel previous in-flight planning job to prevent stale responses from overwriting newer state
+        currentPlanningJob?.cancel()
 
         // 1. Voice Cancellation Check ("Stop", "Cancel", "থামো", "বন্ধ করো")
         val cleanLower = trimmed.lowercase()
@@ -69,73 +73,77 @@ class CommandProcessor(
             return
         }
 
-        coroutineScope.launch {
-            val startTime = System.currentTimeMillis()
-            taskStateManager.updateState(TaskState.PLANNING, actionDescription = "Perceiving & synthesizing action plan...")
+        currentPlanningJob = coroutineScope.launch {
+            try {
+                val startTime = System.currentTimeMillis()
+                taskStateManager.updateState(TaskState.PLANNING, actionDescription = "Perceiving & synthesizing action plan...")
 
-            val planningResult = taskPlanner.plan(trimmed)
-            when (planningResult) {
-                is PlanningResult.Conversational -> {
-                    taskStateManager.completeTask(planningResult.spokenResponse)
-                    memoryRepository.recordTaskHistory(
-                        taskId = taskId,
-                        prompt = trimmed,
-                        status = "COMPLETED",
-                        actionsCount = 0,
-                        executionTimeMs = System.currentTimeMillis() - startTime,
-                        summary = planningResult.spokenResponse
-                    )
-                    onResponseGeneratedListener?.invoke(planningResult.spokenResponse)
-                }
-
-                is PlanningResult.Unsupported -> {
-                    val summary = "Capability not yet available: ${planningResult.capability}"
-                    taskStateManager.failTask(summary)
-                    memoryRepository.recordTaskHistory(
-                        taskId = taskId,
-                        prompt = trimmed,
-                        status = "FAILED",
-                        actionsCount = 0,
-                        executionTimeMs = System.currentTimeMillis() - startTime,
-                        summary = summary
-                    )
-                    onResponseGeneratedListener?.invoke(planningResult.spokenResponse)
-                }
-
-                is PlanningResult.Error -> {
-                    taskStateManager.failTask(planningResult.message)
-                    memoryRepository.recordTaskHistory(
-                        taskId = taskId,
-                        prompt = trimmed,
-                        status = "FAILED",
-                        actionsCount = 0,
-                        executionTimeMs = System.currentTimeMillis() - startTime,
-                        summary = planningResult.message
-                    )
-                    val errorSpoken = if (planningResult.isKeyMissing) {
-                        "Gemini API key is not configured. Please configure it in Settings."
-                    } else {
-                        "I could not process that command: ${planningResult.message}"
-                    }
-                    onResponseGeneratedListener?.invoke(errorSpoken)
-                }
-
-                is PlanningResult.Success -> {
-                    val actions = planningResult.actions
-                    val plannedSpoken = planningResult.spokenResponse
-
-                    if (actionQueue != null) {
-                        actionQueue.enqueueTask(
+                val planningResult = taskPlanner.plan(trimmed)
+                when (planningResult) {
+                    is PlanningResult.Conversational -> {
+                        taskStateManager.completeTask(planningResult.spokenResponse)
+                        memoryRepository.recordTaskHistory(
                             taskId = taskId,
                             prompt = trimmed,
-                            actions = actions,
-                            introductorySpeech = plannedSpoken
+                            status = "COMPLETED",
+                            actionsCount = 0,
+                            executionTimeMs = System.currentTimeMillis() - startTime,
+                            summary = planningResult.spokenResponse
                         )
-                    } else {
-                        // Fallback sequential execution if queue is not injected
-                        executeActionQueueFallback(taskId, startTime, actions, plannedSpoken)
+                        onResponseGeneratedListener?.invoke(planningResult.spokenResponse)
+                    }
+
+                    is PlanningResult.Unsupported -> {
+                        val summary = "Capability not yet available: ${planningResult.capability}"
+                        taskStateManager.failTask(summary)
+                        memoryRepository.recordTaskHistory(
+                            taskId = taskId,
+                            prompt = trimmed,
+                            status = "FAILED",
+                            actionsCount = 0,
+                            executionTimeMs = System.currentTimeMillis() - startTime,
+                            summary = summary
+                        )
+                        onResponseGeneratedListener?.invoke(planningResult.spokenResponse)
+                    }
+
+                    is PlanningResult.Error -> {
+                        taskStateManager.failTask(planningResult.message)
+                        memoryRepository.recordTaskHistory(
+                            taskId = taskId,
+                            prompt = trimmed,
+                            status = "FAILED",
+                            actionsCount = 0,
+                            executionTimeMs = System.currentTimeMillis() - startTime,
+                            summary = planningResult.message
+                        )
+                        val errorSpoken = if (planningResult.isKeyMissing) {
+                            "Gemini API key is not configured. Please configure it in Settings."
+                        } else {
+                            "I could not process that command: ${planningResult.message}"
+                        }
+                        onResponseGeneratedListener?.invoke(errorSpoken)
+                    }
+
+                    is PlanningResult.Success -> {
+                        val actions = planningResult.actions
+                        val plannedSpoken = planningResult.spokenResponse
+
+                        if (actionQueue != null) {
+                            actionQueue.enqueueTask(
+                                taskId = taskId,
+                                prompt = trimmed,
+                                actions = actions,
+                                introductorySpeech = plannedSpoken
+                            )
+                        } else {
+                            // Fallback sequential execution if queue is not injected
+                            executeActionQueueFallback(taskId, startTime, actions, plannedSpoken)
+                        }
                     }
                 }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                // Request superseded or cancelled gracefully
             }
         }
     }
@@ -255,6 +263,7 @@ class CommandProcessor(
     }
 
     fun cancelPendingAction() {
+        currentPlanningJob?.cancel()
         if (agentOrchestrator?.isRunning?.value == true) {
             agentOrchestrator.cancelTask(reason = "User cancelled pending action", informUser = true)
             return

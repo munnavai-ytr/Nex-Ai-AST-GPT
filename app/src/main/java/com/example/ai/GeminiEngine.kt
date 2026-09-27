@@ -11,7 +11,23 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+enum class GeminiErrorType {
+    NO_INTERNET,
+    AUTH_OR_QUOTA,
+    TIMEOUT,
+    SERVER_ERROR,
+    KEY_MISSING,
+    EMPTY_RESPONSE,
+    MALFORMED_RESPONSE,
+    CANCELLED,
+    UNKNOWN
+}
 
 sealed class GeminiPlanResult {
     data class Success(
@@ -21,7 +37,12 @@ sealed class GeminiPlanResult {
         val rawResponse: String = ""
     ) : GeminiPlanResult()
 
-    data class Error(val message: String, val isKeyMissing: Boolean = false) : GeminiPlanResult()
+    data class Error(
+        val message: String,
+        val errorType: GeminiErrorType = GeminiErrorType.UNKNOWN,
+        val statusCode: Int? = null,
+        val isKeyMissing: Boolean = false
+    ) : GeminiPlanResult()
 }
 
 class GeminiEngine(private val config: GeminiConfig) {
@@ -33,17 +54,31 @@ class GeminiEngine(private val config: GeminiConfig) {
         .build()
 
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val isRequestInFlight = AtomicBoolean(false)
 
+    /**
+     * Sends a planning and conversational prompt to the configured Gemini model.
+     * Prevents duplicate simultaneous requests and handles timeouts, network drops, and schema errors.
+     */
     suspend fun planActions(
         userPrompt: String,
         activeAppPackage: String? = null,
         screenVisibleTexts: List<String> = emptyList(),
         memoryContext: String? = null
     ): GeminiPlanResult = withContext(Dispatchers.IO) {
+        val trimmedPrompt = userPrompt.trim()
+        if (trimmedPrompt.isBlank()) {
+            return@withContext GeminiPlanResult.Error(
+                message = "Prompt cannot be empty.",
+                errorType = GeminiErrorType.EMPTY_RESPONSE
+            )
+        }
+
         val apiKey = config.getApiKey()
         if (apiKey.isBlank()) {
             return@withContext GeminiPlanResult.Error(
                 message = "Gemini API key is not configured. Please configure it in Settings or via Secrets.",
+                errorType = GeminiErrorType.KEY_MISSING,
                 isKeyMissing = true
             )
         }
@@ -104,7 +139,7 @@ class GeminiEngine(private val config: GeminiConfig) {
                     put(JSONObject().apply {
                         put("parts", JSONArray().apply {
                             put(JSONObject().apply {
-                                put("text", "User command: $userPrompt")
+                                put("text", "User command: $trimmedPrompt")
                             })
                         })
                     })
@@ -131,17 +166,49 @@ class GeminiEngine(private val config: GeminiConfig) {
                 .build()
 
             val httpResponse = httpClient.newCall(httpRequest).execute()
+            val responseCode = httpResponse.code
             val responseString = httpResponse.body?.string() ?: ""
 
             if (!httpResponse.isSuccessful) {
+                val errorType = when (responseCode) {
+                    401, 403, 429 -> GeminiErrorType.AUTH_OR_QUOTA
+                    in 500..599 -> GeminiErrorType.SERVER_ERROR
+                    else -> GeminiErrorType.UNKNOWN
+                }
+                val parsedErrorMsg = parseErrorMessage(responseString)
+                val userFriendlyMessage = when (errorType) {
+                    GeminiErrorType.AUTH_OR_QUOTA -> "Gemini API authentication or quota limit exceeded ($responseCode): $parsedErrorMsg"
+                    GeminiErrorType.SERVER_ERROR -> "Gemini service temporarily unavailable ($responseCode). Please try again."
+                    else -> "Gemini API call failed ($responseCode): $parsedErrorMsg"
+                }
                 return@withContext GeminiPlanResult.Error(
-                    message = "Gemini API call failed (${httpResponse.code}): ${parseErrorMessage(responseString)}"
+                    message = userFriendlyMessage,
+                    errorType = errorType,
+                    statusCode = responseCode
                 )
             }
 
-            parseGeminiOutput(responseString, userPrompt)
+            parseGeminiOutput(responseString, trimmedPrompt)
+        } catch (e: UnknownHostException) {
+            GeminiPlanResult.Error(
+                message = "No internet connection. Please check your network connectivity.",
+                errorType = GeminiErrorType.NO_INTERNET
+            )
+        } catch (e: SocketTimeoutException) {
+            GeminiPlanResult.Error(
+                message = "Request to Gemini API timed out. Please check network speed and try again.",
+                errorType = GeminiErrorType.TIMEOUT
+            )
+        } catch (e: IOException) {
+            GeminiPlanResult.Error(
+                message = "Network error contacting Gemini: ${e.message ?: "Connection failed"}",
+                errorType = GeminiErrorType.NO_INTERNET
+            )
         } catch (e: Exception) {
-            GeminiPlanResult.Error("Network error contacting Gemini: ${e.localizedMessage ?: e.message}")
+            GeminiPlanResult.Error(
+                message = "Unexpected error communicating with Gemini: ${e.localizedMessage ?: e.message}",
+                errorType = GeminiErrorType.UNKNOWN
+            )
         }
     }
 
@@ -155,14 +222,48 @@ class GeminiEngine(private val config: GeminiConfig) {
         }
     }
 
-    private fun parseGeminiOutput(responseBody: String, originalPrompt: String): GeminiPlanResult {
+    fun parseGeminiOutput(responseBody: String, originalPrompt: String): GeminiPlanResult {
+        if (responseBody.isBlank()) {
+            return GeminiPlanResult.Error(
+                message = "Received empty response body from Gemini API",
+                errorType = GeminiErrorType.EMPTY_RESPONSE
+            )
+        }
+
         try {
             val root = JSONObject(responseBody)
-            val candidates = root.optJSONArray("candidates") ?: return GeminiPlanResult.Error("Empty candidate response from Gemini")
-            val firstCandidate = candidates.optJSONObject(0) ?: return GeminiPlanResult.Error("Missing candidate content")
-            val content = firstCandidate.optJSONObject("content") ?: return GeminiPlanResult.Error("Missing candidate content parts")
-            val parts = content.optJSONArray("parts") ?: return GeminiPlanResult.Error("Missing text parts")
-            val text = parts.optJSONObject(0)?.optString("text") ?: return GeminiPlanResult.Error("Missing text from Gemini")
+            val candidates = root.optJSONArray("candidates")
+                ?: return GeminiPlanResult.Error(
+                    message = "No candidates returned from Gemini API",
+                    errorType = GeminiErrorType.EMPTY_RESPONSE
+                )
+
+            val firstCandidate = candidates.optJSONObject(0)
+                ?: return GeminiPlanResult.Error(
+                    message = "Missing candidate content in Gemini response",
+                    errorType = GeminiErrorType.EMPTY_RESPONSE
+                )
+
+            val content = firstCandidate.optJSONObject("content")
+                ?: return GeminiPlanResult.Error(
+                    message = "Missing candidate content object in Gemini response",
+                    errorType = GeminiErrorType.MALFORMED_RESPONSE
+                )
+
+            val parts = content.optJSONArray("parts")
+                ?: return GeminiPlanResult.Error(
+                    message = "Missing content parts in Gemini response",
+                    errorType = GeminiErrorType.MALFORMED_RESPONSE
+                )
+
+            val firstPart = parts.optJSONObject(0)
+            val text = firstPart?.optString("text")
+            if (text.isNullOrBlank()) {
+                return GeminiPlanResult.Error(
+                    message = "Received blank text part in Gemini response",
+                    errorType = GeminiErrorType.EMPTY_RESPONSE
+                )
+            }
 
             val cleanJson = text.trim()
                 .removePrefix("```json")
@@ -170,16 +271,22 @@ class GeminiEngine(private val config: GeminiConfig) {
                 .removeSuffix("```")
                 .trim()
 
+            if (cleanJson.isBlank()) {
+                return GeminiPlanResult.Error(
+                    message = "Extracted empty JSON string from Gemini text part",
+                    errorType = GeminiErrorType.EMPTY_RESPONSE
+                )
+            }
+
             var spokenResponse = ""
             var unsupportedCap: String? = null
             val actions = mutableListOf<Action>()
 
             if (cleanJson.startsWith("[")) {
-                // Legacy or direct array format
                 val array = JSONArray(cleanJson)
                 actions.addAll(parseActionsArray(array))
                 spokenResponse = "Executing ${actions.size} actions for: $originalPrompt"
-            } else {
+            } else if (cleanJson.startsWith("{")) {
                 val obj = JSONObject(cleanJson)
                 spokenResponse = obj.optString("spokenResponse", "")
                 if (obj.has("unsupportedCapability") && !obj.isNull("unsupportedCapability")) {
@@ -187,6 +294,11 @@ class GeminiEngine(private val config: GeminiConfig) {
                 }
                 val actionsArray = obj.optJSONArray("actions") ?: JSONArray()
                 actions.addAll(parseActionsArray(actionsArray))
+            } else {
+                return GeminiPlanResult.Error(
+                    message = "Gemini response is not valid JSON object or array",
+                    errorType = GeminiErrorType.MALFORMED_RESPONSE
+                )
             }
 
             if (spokenResponse.isBlank()) {
@@ -206,11 +318,14 @@ class GeminiEngine(private val config: GeminiConfig) {
                 rawResponse = responseBody
             )
         } catch (e: Exception) {
-            return GeminiPlanResult.Error("Failed to parse Gemini structured response: ${e.message}")
+            return GeminiPlanResult.Error(
+                message = "Failed to parse Gemini structured response: ${e.message}",
+                errorType = GeminiErrorType.MALFORMED_RESPONSE
+            )
         }
     }
 
-    private fun parseActionsArray(jsonArray: JSONArray): List<Action> {
+    fun parseActionsArray(jsonArray: JSONArray): List<Action> {
         val actions = mutableListOf<Action>()
         for (i in 0 until jsonArray.length()) {
             val item = jsonArray.optJSONObject(i) ?: continue

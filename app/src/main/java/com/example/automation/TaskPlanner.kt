@@ -21,7 +21,11 @@ sealed class PlanningResult {
         val spokenResponse: String
     ) : PlanningResult()
 
-    data class Error(val message: String, val isKeyMissing: Boolean = false) : PlanningResult()
+    data class Error(
+        val message: String,
+        val isKeyMissing: Boolean = false,
+        val errorType: com.example.ai.GeminiErrorType = com.example.ai.GeminiErrorType.UNKNOWN
+    ) : PlanningResult()
 }
 
 class TaskPlanner(
@@ -95,7 +99,11 @@ class TaskPlanner(
                     return localPlan
                 }
 
-                return PlanningResult.Error(geminiResult.message, isKeyMissing = geminiResult.isKeyMissing)
+                return PlanningResult.Error(
+                    message = geminiResult.message,
+                    isKeyMissing = geminiResult.isKeyMissing,
+                    errorType = geminiResult.errorType
+                )
             }
         }
     }

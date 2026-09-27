@@ -9,6 +9,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SpeechRecognizerManager(
     private val context: Context,
@@ -19,6 +20,7 @@ class SpeechRecognizerManager(
     private var speechRecognizer: SpeechRecognizer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isCurrentlyListening = false
+    private val hasDeliveredFinalResult = AtomicBoolean(false)
     private val recordedAudioStream = ByteArrayOutputStream()
 
     // Secondary constructor for single-parameter string callback
@@ -33,7 +35,11 @@ class SpeechRecognizerManager(
     )
 
     fun isRecognitionAvailable(): Boolean {
-        return SpeechRecognizer.isRecognitionAvailable(context)
+        return try {
+            SpeechRecognizer.isRecognitionAvailable(context)
+        } catch (_: Exception) {
+            false
+        }
     }
 
     fun isListening(): Boolean = isCurrentlyListening
@@ -41,11 +47,14 @@ class SpeechRecognizerManager(
     fun startListening(language: VoiceLanguage = VoiceLanguage.ENGLISH_US) {
         mainHandler.post {
             if (!isRecognitionAvailable()) {
+                isCurrentlyListening = false
                 onVoiceStateChange(VoiceState.Unavailable("Android SpeechRecognizer is not available on this device."))
                 return@post
             }
 
-            stopListening()
+            // Clean up any ongoing or prior session cleanly
+            cleanupRecognizer()
+            hasDeliveredFinalResult.set(false)
             recordedAudioStream.reset()
 
             try {
@@ -81,9 +90,10 @@ class SpeechRecognizerManager(
 
                         override fun onError(error: Int) {
                             isCurrentlyListening = false
+                            hasDeliveredFinalResult.set(true)
                             val errorMessage = when (error) {
-                                SpeechRecognizer.ERROR_AUDIO -> "Audio recording error. Check microphone."
-                                SpeechRecognizer.ERROR_CLIENT -> "Client speech recognition error ($error)"
+                                SpeechRecognizer.ERROR_AUDIO -> "Microphone audio recording error. Please check your audio input."
+                                SpeechRecognizer.ERROR_CLIENT -> "Speech recognition client error ($error)"
                                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                                     onVoiceStateChange(
                                         VoiceState.PermissionRequired(
@@ -92,12 +102,12 @@ class SpeechRecognizerManager(
                                     )
                                     return
                                 }
-                                SpeechRecognizer.ERROR_NETWORK -> "Network error during speech recognition"
-                                SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Network connection timed out"
+                                SpeechRecognizer.ERROR_NETWORK -> "Network error during speech recognition. Check your internet connection."
+                                SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "Speech recognition network connection timed out."
                                 SpeechRecognizer.ERROR_NO_MATCH -> "No speech recognized. Please speak again."
-                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer engine is busy"
-                                SpeechRecognizer.ERROR_SERVER -> "Recognition server error occurred"
-                                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected before timeout"
+                                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognition engine is currently busy. Please retry."
+                                SpeechRecognizer.ERROR_SERVER -> "Recognition server error occurred."
+                                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected before timeout. Please try again."
                                 else -> "Speech recognition error ($error)"
                             }
                             onVoiceStateChange(VoiceState.Error(errorMessage, error))
@@ -108,18 +118,24 @@ class SpeechRecognizerManager(
                             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             val transcript = matches?.firstOrNull()?.trim() ?: ""
                             val audioBytes = recordedAudioStream.toByteArray()
+
+                            // Guarantee exact-once delivery of recognized speech to AI
                             if (transcript.isNotBlank()) {
-                                onVoiceStateChange(VoiceState.Processing)
-                                onFinalResult(transcript, audioBytes)
+                                if (hasDeliveredFinalResult.compareAndSet(false, true)) {
+                                    onVoiceStateChange(VoiceState.Processing)
+                                    onFinalResult(transcript, audioBytes)
+                                }
                             } else {
-                                onVoiceStateChange(VoiceState.Error("No intelligible words captured."))
+                                if (hasDeliveredFinalResult.compareAndSet(false, true)) {
+                                    onVoiceStateChange(VoiceState.Error("No intelligible words captured. Please speak again.", SpeechRecognizer.ERROR_NO_MATCH))
+                                }
                             }
                         }
 
                         override fun onPartialResults(partialResults: Bundle?) {
                             val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                             val partial = matches?.firstOrNull()?.trim() ?: ""
-                            if (partial.isNotBlank()) {
+                            if (partial.isNotBlank() && isCurrentlyListening) {
                                 onVoiceStateChange(VoiceState.Listening(2.5f, partial))
                             }
                         }
@@ -141,6 +157,7 @@ class SpeechRecognizerManager(
                 speechRecognizer?.startListening(intent)
             } catch (e: Exception) {
                 isCurrentlyListening = false
+                hasDeliveredFinalResult.set(true)
                 onVoiceStateChange(VoiceState.Error(e.message ?: "Failed to initialize SpeechRecognizer"))
             }
         }
@@ -149,15 +166,26 @@ class SpeechRecognizerManager(
     fun stopListening() {
         mainHandler.post {
             isCurrentlyListening = false
+            hasDeliveredFinalResult.set(true)
             try {
                 speechRecognizer?.stopListening()
-                speechRecognizer?.destroy()
-                speechRecognizer = null
             } catch (_: Exception) {}
         }
     }
 
+    private fun cleanupRecognizer() {
+        try {
+            speechRecognizer?.stopListening()
+            speechRecognizer?.cancel()
+            speechRecognizer?.destroy()
+        } catch (_: Exception) {}
+        speechRecognizer = null
+        isCurrentlyListening = false
+    }
+
     fun destroy() {
-        stopListening()
+        mainHandler.post {
+            cleanupRecognizer()
+        }
     }
 }
